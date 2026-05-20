@@ -5,8 +5,10 @@
 #include <getopt.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <termios.h>
@@ -74,6 +76,7 @@ typedef struct {
 	double last_hist;
 	double win_time[WIN_SAMPLES];
 	size_t win_bytes[WIN_SAMPLES];
+	size_t win_total_bytes;
 	int win_start;
 	int win_count;
 	double hist[HIST_SAMPLES];
@@ -85,7 +88,7 @@ typedef struct {
 
 typedef struct {
 	const char *url;
-	volatile sig_atomic_t active;
+	atomic_bool active;
 	double samples[16];
 	int count;
 } ping_thread_t;
@@ -108,9 +111,8 @@ static double now_seconds(void) {
 }
 
 static void sleep_ms(long ms) {
-	struct timespec req = {.tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000L};
-	while (nanosleep(&req, &req) == -1 && errno == EINTR) {
-	}
+	struct timespec req = { .tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000L };
+	while (nanosleep(&req, &req) == -1 && errno == EINTR);
 }
 
 static void buf_free(buffer_t *buffer) {
@@ -122,12 +124,18 @@ static void buf_free(buffer_t *buffer) {
 
 static size_t buf_write(void *ptr, size_t size, size_t nmemb, void *userdata) {
 	buffer_t *buffer = userdata;
+	if (size != 0 && nmemb > SIZE_MAX / size) return 0;
 	size_t bytes = size * nmemb;
+	if (buffer->len > SIZE_MAX - bytes - 1) return 0;
 	size_t need = buffer->len + bytes + 1;
 
 	if (need > buffer->cap) {
 		size_t cap = buffer->cap ? buffer->cap * 2 : 4096;
 		while (cap < need) {
+			if (cap > SIZE_MAX / 2) {
+				cap = need;
+				break;
+			}
 			cap *= 2;
 		}
 		char *data = realloc(buffer->data, cap);
@@ -151,15 +159,9 @@ static size_t sink_write(void *ptr, size_t size, size_t nmemb, void *userdata) {
 }
 
 static size_t copy_slice(char *out, size_t out_size, const char *src, size_t len) {
-	if (!out_size) {
-		return 0;
-	}
-	if (len >= out_size) {
-		len = out_size - 1;
-	}
-	if (len) {
-		memcpy(out, src, len);
-	}
+	if (!out_size) return 0;
+	if (len >= out_size) len = out_size - 1;
+	if (len) memcpy(out, src, len);
 	out[len] = 0;
 	return len;
 }
@@ -173,6 +175,15 @@ static size_t append_text(char *out, size_t out_size, const char *src) {
 	return used + copy_slice(out + used, out_size - used, src, strlen(src));
 }
 
+static void curl_common_opts(CURL *curl, long connect_timeout_ms, long timeout_ms) {
+	curl_easy_setopt(curl, CURLOPT_USERAGENT, "fast-c/1.0");
+	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, connect_timeout_ms);
+	if (timeout_ms > 0) curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
+	curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 0L);
+	curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 0L);
+	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+}
+
 static char *http_text(const char *url, long timeout_ms) {
 	buffer_t buffer = { 0 };
 	CURL *curl = curl_easy_init();
@@ -184,10 +195,7 @@ static char *http_text(const char *url, long timeout_ms) {
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
 	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 	curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
-	curl_easy_setopt(curl, CURLOPT_USERAGENT, "fast-c/1.0");
-	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
-	curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
-	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+	curl_common_opts(curl, 5000L, timeout_ms);
 
 	CURLcode code = curl_easy_perform(curl);
 	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
@@ -229,13 +237,9 @@ static bool json_string(const char *src, const char *key, char *out, size_t out_
 }
 
 static void format_location(char *out, size_t out_size, const char *city, const char *country) {
-	if (*city && *country) {
-		snprintf(out, out_size, "%s, %s", city, country);
-	} else if (*city) {
-		snprintf(out, out_size, "%s", city);
-	} else {
-		snprintf(out, out_size, "%s", country);
-	}
+	if (*city && *country) snprintf(out, out_size, "%s, %s", city, country);
+	else if (*city) snprintf(out, out_size, "%s", city);
+	else snprintf(out, out_size, "%s", country);
 }
 
 static int cmp_double(const void *left, const void *right) {
@@ -245,16 +249,10 @@ static int cmp_double(const void *left, const void *right) {
 }
 
 static double percentile(const double *values, int count, double pct) {
-	if (count <= 0) {
-		return -1.0;
-	}
+	if (count <= 0) return -1.0;
 	double tmp[32];
-	if (count > (int) (sizeof(tmp) / sizeof(tmp[0]))) {
-		count = (int) (sizeof(tmp) / sizeof(tmp[0]));
-	}
-	for (int i = 0; i < count; i++) {
-		tmp[i] = values[i];
-	}
+	if (count > (int) (sizeof(tmp) / sizeof(tmp[0]))) count = (int) (sizeof(tmp) / sizeof(tmp[0]));
+	for (int i = 0; i < count; ++i) tmp[i] = values[i];
 	qsort(tmp, (size_t) count, sizeof(tmp[0]), cmp_double);
 	return tmp[(int) ((count - 1) * pct)];
 }
@@ -310,14 +308,10 @@ static bool load_fast_info(fast_info_t *fast) {
 	const char *cursor = targets;
 	while (fast->target_count < MAX_TARGETS) {
 		const char *url_key = strstr(cursor, "\"url\":\"");
-		if (!url_key) {
-			break;
-		}
+		if (!url_key) break;
 		url_key += strlen("\"url\":\"");
 		const char *url_end = strchr(url_key, '"');
-		if (!url_end) {
-			break;
-		}
+		if (!url_end) break;
 		size_t url_len = (size_t) (url_end - url_key);
 		copy_slice(fast->urls[fast->target_count], sizeof(fast->urls[0]), url_key, url_len);
 
@@ -345,10 +339,8 @@ cleanup:
 
 static void join_servers(const fast_info_t *fast, char *out, size_t out_size) {
 	out[0] = 0;
-	for (int i = 0; i < fast->target_count; i++) {
-		if (i) {
-			append_text(out, out_size, " | ");
-		}
+	for (int i = 0; i < fast->target_count; ++i) {
+		if (i) append_text(out, out_size, " | ");
 		append_text(out, out_size, fast->servers[i]);
 	}
 }
@@ -357,9 +349,7 @@ static void ui_start(ui_t *ui, FILE *stream) {
 	memset(ui, 0, sizeof(*ui));
 	ui->stream = stream;
 	ui->tty = stream && isatty(fileno(stream));
-	if (!ui->tty) {
-		return;
-	}
+	if (!ui->tty) return;
 	if (isatty(STDIN_FILENO) && tcgetattr(STDIN_FILENO, &ui->saved) == 0) {
 		struct termios raw = ui->saved;
 		raw.c_lflag &= (tcflag_t) ~(ICANON | ECHO);
@@ -372,42 +362,26 @@ static void ui_start(ui_t *ui, FILE *stream) {
 }
 
 static void ui_clear(ui_t *ui) {
-	if (!ui->tty || !ui->lines) {
-		return;
-	}
-	if (ui->lines > 1) {
-		fprintf(ui->stream, "\033[%dA", ui->lines - 1);
-	}
-	for (int i = 0; i < ui->lines; i++) {
+	if (!ui->tty || !ui->lines) return;
+	if (ui->lines > 1) fprintf(ui->stream, "\033[%dA", ui->lines - 1);
+	for (int i = 0; i < ui->lines; ++i) {
 		fputs("\r\033[2K", ui->stream);
-		if (i + 1 < ui->lines) {
-			fputs("\033[1B", ui->stream);
-		}
+		if (i + 1 < ui->lines) fputs("\033[1B", ui->stream);
 	}
-	if (ui->lines > 1) {
-		fprintf(ui->stream, "\033[%dA", ui->lines - 1);
-	}
+	if (ui->lines > 1) fprintf(ui->stream, "\033[%dA", ui->lines - 1);
 }
 
 static void ui_stop(ui_t *ui, bool newline) {
-	if (!ui->tty) {
-		return;
-	}
-	if (ui->raw) {
-		tcsetattr(STDIN_FILENO, TCSAFLUSH, &ui->saved);
-	}
+	if (!ui->tty) return;
+	if (ui->raw) tcsetattr(STDIN_FILENO, TCSAFLUSH, &ui->saved);
 	fputs("\033[?25h", ui->stream);
-	if (newline) {
-		fputc('\n', ui->stream);
-	}
+	if (newline) fputc('\n', ui->stream);
 	fflush(ui->stream);
 	ui->lines = 0;
 }
 
 static void ui_render(ui_t *ui, const options_t *options, const fast_info_t *fast, const result_t *result, bool final) {
-	if (!ui->tty) {
-		return;
-	}
+	if (!ui->tty) return;
 
 	char servers[512];
 	char main_line[256];
@@ -449,36 +423,29 @@ static void ui_render(ui_t *ui, const options_t *options, const fast_info_t *fas
 }
 
 static void meter_push(meter_t *meter, size_t bytes, double t) {
+	while (meter->win_count > 0 && t - meter->win_time[meter->win_start] > 0.8) {
+		meter->win_total_bytes -= meter->win_bytes[meter->win_start];
+		meter->win_start = (meter->win_start + 1) % WIN_SAMPLES;
+		meter->win_count -= 1;
+	}
 	if (meter->win_count == WIN_SAMPLES) {
+		meter->win_total_bytes -= meter->win_bytes[meter->win_start];
 		meter->win_start = (meter->win_start + 1) % WIN_SAMPLES;
 		meter->win_count -= 1;
 	}
 	int slot = (meter->win_start + meter->win_count) % WIN_SAMPLES;
 	meter->win_time[slot] = t;
 	meter->win_bytes[slot] = bytes;
+	meter->win_total_bytes += bytes;
 	meter->win_count += 1;
 }
 
-static double meter_rate(const meter_t *meter, double t) {
-	size_t bytes = 0;
-	double first = 0.0;
-	bool seen = false;
-	for (int i = 0; i < meter->win_count; i++) {
-		int slot = (meter->win_start + i) % WIN_SAMPLES;
-		if (t - meter->win_time[slot] > 0.8) {
-			continue;
-		}
-		if (!seen) {
-			first = meter->win_time[slot];
-			seen = true;
-		}
-		bytes += meter->win_bytes[slot];
-	}
-    if (!seen) return 0.0;
 
-    double dt = t - first;
+static double meter_rate(const meter_t *meter, double t) {
+	if (meter->win_count == 0) return 0.0;	
+	double dt = t - meter->win_time[meter->win_start];
 	if (dt < 0.05) dt = 0.05;
-	return (double) bytes * 8.0 / dt / 1000000.0;
+	return (double) meter->win_total_bytes * 8.0 / dt / 1000000.0;
 }
 
 static void meter_hist(meter_t *meter, double value) {
@@ -491,18 +458,12 @@ static void meter_hist(meter_t *meter, double value) {
 }
 
 static bool meter_stable(const meter_t *meter) {
-	if (meter->hist_count < 6) {
-		return false;
-	}
+	if (meter->hist_count < 6) return false;
 	double min = meter->hist[meter->hist_count - 6];
 	double max = min;
-	for (int i = meter->hist_count - 6; i < meter->hist_count; i++) {
-		if (meter->hist[i] < min) {
-			min = meter->hist[i];
-		}
-		if (meter->hist[i] > max) {
-			max = meter->hist[i];
-		}
+	for (int i = meter->hist_count - 6; i < meter->hist_count; ++i) {
+		if (meter->hist[i] < min) min = meter->hist[i];
+		if (meter->hist[i] > max) max = meter->hist[i];
 	}
 	return max > 0.0 && ((max - min) / max) <= 0.08;
 }
@@ -511,7 +472,7 @@ static double meter_final(const meter_t *meter) {
 	if (meter->hist_count > 0) {
 		double sum = 0.0;
 		int take = meter->hist_count < 6 ? meter->hist_count : 6;
-		for (int i = meter->hist_count - take; i < meter->hist_count; i++) {
+		for (int i = meter->hist_count - take; i < meter->hist_count; ++i) {
 			sum += meter->hist[i];
 		}
 		return sum / take;
@@ -566,11 +527,9 @@ static void curl_measure_opts(CURL *curl, meter_t *meter) {
 	curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
 	curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, meter_progress);
 	curl_easy_setopt(curl, CURLOPT_XFERINFODATA, meter);
-	curl_easy_setopt(curl, CURLOPT_USERAGENT, "fast-c/1.0");
-	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
 	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
 	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 10L);
-	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+	curl_common_opts(curl, 5000L, 0L);
 }
 
 static double ping_once(const char *url) {
@@ -582,10 +541,7 @@ static double ping_once(const char *url) {
 	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
 	curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, 0L);
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, sink_write);
-	curl_easy_setopt(curl, CURLOPT_USERAGENT, "fast-c/1.0");
-	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
-	curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 8000L);
-	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+	curl_common_opts(curl, 5000L, 8000L);
 	CURLcode code = curl_easy_perform(curl);
 	double time = -1.0;
 	if (code == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_TOTAL_TIME, &time);
@@ -595,7 +551,7 @@ static double ping_once(const char *url) {
 
 static void *ping_thread(void *userdata) {
 	ping_thread_t *thread = userdata;
-	while (thread->active && !g_stop) {
+	while (atomic_load_explicit(&thread->active, memory_order_relaxed) && !g_stop) {
 		double ms = ping_once(thread->url);
 		if (ms >= 0.0 && thread->count < (int) (sizeof(thread->samples) / sizeof(thread->samples[0]))) {
 			thread->samples[thread->count++] = ms;
@@ -621,9 +577,11 @@ static bool run_phase(const fast_info_t *fast, const options_t *options, ui_t *u
 	struct curl_slist *headers = NULL;
 	ping_thread_t ping = { 0 };
 	pthread_t ping_tid;
+	CURL *curl = NULL;
 	bool have_ping_thread = false;
 	bool ok = false;
 	bool collect_latency = needs_latency(options);
+	atomic_init(&ping.active, false);
 
 	if (upload) {
 		payload = calloc(1, UPLOAD_SIZE);
@@ -632,16 +590,19 @@ static bool run_phase(const fast_info_t *fast, const options_t *options, ui_t *u
 		if (!headers) goto cleanup;
 		if (collect_latency) {
 			ping.url = fast->urls[0];
-			ping.active = 1;
+			atomic_store_explicit(&ping.active, true, memory_order_relaxed);
 			have_ping_thread = pthread_create(&ping_tid, NULL, ping_thread, &ping) == 0;
+			if (!have_ping_thread) {
+				atomic_store_explicit(&ping.active, false, memory_order_relaxed);
+			}
 		}
 	}
 
-	for (int turn = 0; !g_stop && !meter.done; turn++) {
-		CURL *curl = curl_easy_init();
-		if (!curl) {
-			break;
-		}
+	curl = curl_easy_init();
+	if (!curl) goto cleanup;
+
+	for (int turn = 0; !g_stop && !meter.done; ++turn) {
+		curl_easy_reset(curl);
 		meter.last_now = 0;
 		curl_measure_opts(curl, &meter);
 		curl_easy_setopt(curl, CURLOPT_URL, fast->urls[turn % (fast->target_count < 2 ? fast->target_count : 2)]);
@@ -654,7 +615,6 @@ static bool run_phase(const fast_info_t *fast, const options_t *options, ui_t *u
 			curl_easy_setopt(curl, CURLOPT_RANGE, BIG_RANGE);
 		}
 		CURLcode code = curl_easy_perform(curl);
-		curl_easy_cleanup(curl);
 		if (code != CURLE_OK && code != CURLE_ABORTED_BY_CALLBACK && meter.total_bytes == 0) break;
 		if ((now_seconds() - meter.start) >= meter.max_seconds) break;
 	}
@@ -662,11 +622,12 @@ static bool run_phase(const fast_info_t *fast, const options_t *options, ui_t *u
 
 	cleanup:
 	if (have_ping_thread) {
-		ping.active = 0;
+		atomic_store_explicit(&ping.active, false, memory_order_relaxed);
 		pthread_join(ping_tid, NULL);
 		result->loaded_latency = percentile(ping.samples, ping.count, 0.75);
 	}
 
+	curl_easy_cleanup(curl);
 	free(payload);
 	curl_slist_free_all(headers);
 	if (upload) {
@@ -698,11 +659,11 @@ static void print_help(FILE *stream) {
 
 static bool parse_options(int argc, char **argv, options_t *options) {
 	static const struct option long_options[] = {
-		{"upload", no_argument, NULL, 'u'},
-		{"json", no_argument, NULL, 'j'},
-		{"verbose", no_argument, NULL, 'v'},
-		{"help", no_argument, NULL, 'h'},
-		{NULL, 0, NULL, 0},
+		{ "upload", no_argument, NULL, 'u' },
+		{ "json", no_argument, NULL, 'j' },
+		{ "verbose", no_argument, NULL, 'v' },
+		{ "help", no_argument, NULL, 'h' },
+		{ NULL, 0, NULL, 0 },
 	};
 
 	memset(options, 0, sizeof(*options));
@@ -711,9 +672,7 @@ static bool parse_options(int argc, char **argv, options_t *options) {
 	for (;;) {
 		int idx = 0;
 		int c = getopt_long(argc, argv, "ujvh", long_options, &idx);
-		if (c == -1) {
-			break;
-		}
+		if (c == -1) break;
 		switch (c) {
 			case 'u': options->upload = true; selected += 1; break;
 			case 'j': options->json = true; selected += 1; break;
@@ -741,7 +700,7 @@ static bool parse_options(int argc, char **argv, options_t *options) {
 
 static void print_json_string(const char *s) {
 	putchar('"');
-	for (; *s; s++) {
+	for (; *s; ++s) {
 		if (*s == '"' || *s == '\\') {
 			putchar('\\');
 			putchar(*s);
@@ -761,9 +720,7 @@ static void text_output(const fast_info_t *fast, const options_t *options, const
 		char servers[512];
 		join_servers(fast, servers, sizeof(servers));
 		printf("\nLatency: %.0f ms (unloaded)", result->unloaded_latency >= 0.0 ? result->unloaded_latency : 0.0);
-		if (result->loaded_latency >= 0.0) {
-			printf(" / %.0f ms (loaded)", result->loaded_latency);
-		}
+		if (result->loaded_latency >= 0.0) printf(" / %.0f ms (loaded)", result->loaded_latency);
 		printf("\nClient: %s%s%s\n", fast->user_location, *fast->user_location && *fast->ip ? " | " : "", fast->ip);
 		printf("Server: %s\n", servers);
 	}
@@ -781,10 +738,8 @@ static void json_output(const fast_info_t *fast, const options_t *options, const
 	printf("  \"userLocation\": ");
 	print_json_string(fast->user_location);
 	printf(",\n  \"serverLocations\": [");
-	for (int i = 0; i < fast->target_count; i++) {
-		if (i) {
-			printf(", ");
-		}
+	for (int i = 0; i < fast->target_count; ++i) {
+		if (i) printf(", ");
 		print_json_string(fast->servers[i]);
 	}
 	printf("],\n  \"userIp\": ");
@@ -796,7 +751,7 @@ int main(int argc, char **argv) {
 	options_t options;
 	fast_info_t fast = {0};
 	ui_t ui;
-	result_t result = {.unloaded_latency = -1.0, .loaded_latency = -1.0};
+	result_t result = { .unloaded_latency = -1.0, .loaded_latency = -1.0 };
 	double ping_samples[6];
 	int ping_count = 0;
 	bool ok = false;
@@ -805,6 +760,7 @@ int main(int argc, char **argv) {
     
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
+
 	if (curl_global_init(CURL_GLOBAL_DEFAULT) != 0) {
 		fputs("Failed to initialize libcurl\n", stderr);
 		return 1;
@@ -817,11 +773,9 @@ int main(int argc, char **argv) {
 
 	ui_start(&ui, options.json ? stderr : stdout);
 	if (needs_latency(&options)) {
-		for (int i = 0; i < 6 && !g_stop; i++) {
+		for (int i = 0; i < 6 && !g_stop; ++i) {
 			double ms = ping_once(fast.urls[0]);
-			if (ms >= 0.0) {
-				ping_samples[ping_count++] = ms;
-			}
+			if (ms >= 0.0) ping_samples[ping_count++] = ms;
 			sleep_ms(100);
 		}
 		result.unloaded_latency = percentile(ping_samples, ping_count, 0.10);
